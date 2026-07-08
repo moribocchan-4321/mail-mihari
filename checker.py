@@ -2,6 +2,7 @@
 # 売却メール見張り番 - BIGLOBEの受信箱を直接見て、売れたらスマホに通知する
 # GitHub Actions で5分おきに自動実行される
 
+import csv
 import email
 import email.policy
 import imaplib
@@ -9,6 +10,7 @@ import json
 import os
 import re
 import sys
+import unicodedata
 import urllib.request
 from email.header import Header
 
@@ -19,13 +21,50 @@ MAIL_USER = "anmoriya@kce.biglobe.ne.jp"
 # メールパスワードは環境変数 BIGLOBE_PASSWORD から読む(GitHub Secretsに登録する)
 # 通知の宛先トピックは環境変数 NTFY_TOPIC から読む(GitHub Secretsに登録する)
 
-# 通知に付けるリンク(スマホで開いて取り下げ操作をする場所)
+# 台帳に見つからなかったときの予備リンク(一覧ページ)
 LINK_YAHOO = "https://auctions.yahoo.co.jp/user/jp/show/mystatus?select=selling"  # ヤフオク マイオク(出品中)
 LINK_RAKUMA = "https://fril.jp/mypage"  # ラクマ マイページ
 LINK_MERCARI = "https://mercari-shops.com/"  # メルカリShops 管理画面
 # ==============================================
 
 STATE_FILE = "state.json"
+DAICHO_FILE = "daicho.csv"
+
+SITE_KEY = {"ヤフオク": "yahoo", "メルカリShops": "mercari", "ラクマ": "rakuma"}
+SITE_NAME = {"yahoo": "ヤフオク", "mercari": "メルカリShops", "rakuma": "ラクマ"}
+FALLBACK_LINK = {"yahoo": LINK_YAHOO, "mercari": LINK_MERCARI, "rakuma": LINK_RAKUMA}
+
+
+def norm_title(t):
+    t = unicodedata.normalize("NFKC", t or "")
+    return re.sub(r"\s+", " ", t).strip().upper()
+
+
+def load_daicho():
+    """台帳(3サイト対応表)を読む。無ければ空リスト"""
+    if not os.path.exists(DAICHO_FILE):
+        return []
+    rows = []
+    with open(DAICHO_FILE, "r", encoding="utf-8-sig", newline="") as f:
+        for row in csv.DictReader(f):
+            rows.append(row)
+    return rows
+
+
+def find_in_daicho(daicho, site_key, title):
+    """売れた商品の台帳行を探す。完全一致→前方一致の順"""
+    n = norm_title(title)
+    if not n:
+        return None
+    col = site_key + "_title"
+    for row in daicho:
+        if norm_title(row.get(col, "")) == n:
+            return row
+    for row in daicho:
+        rn = norm_title(row.get(col, ""))
+        if rn and (rn.startswith(n) or n.startswith(rn)):
+            return row
+    return None
 
 
 def parse_mail(subject, sender, body):
@@ -38,43 +77,50 @@ def parse_mail(subject, sender, body):
     if "終了（落札者あり）" in subject or ("Yahoo!オークション" in subject and "落札されました" in subject):
         m = re.search(r"[：:](.+?)\(([a-z]\d+)\)\s*$", subject)
         title = m.group(1).strip() if m else ""
-        item_id = m.group(2) if m else ""
         if not title:
             m2 = re.search(r"商品[：:]\s*(.+)", body)
             title = m2.group(1).strip() if m2 else "(商品名を読み取れず)"
-        return {"site": "ヤフオク", "title": title, "id": item_id,
-                "others": [("ラクマ", LINK_RAKUMA), ("メルカリShops", LINK_MERCARI)]}
+        return {"site": "ヤフオク", "title": title}
 
     # メルカリShops: 差出人 mercari-shops.com / 件名「【メルカリShops】「商品名」の発送をお願いします。」
     if "mercari-shops.com" in sender:
         m = re.search(r"「(.+)」の発送をお願いします", subject)
         if m:
-            m2 = re.search(r"注文番号\s*[:：]\s*(\S+)", body)
-            return {"site": "メルカリShops", "title": m.group(1).strip(),
-                    "id": m2.group(1) if m2 else "",
-                    "others": [("ヤフオク", LINK_YAHOO), ("ラクマ", LINK_RAKUMA)]}
+            return {"site": "メルカリShops", "title": m.group(1).strip()}
 
     # ラクマ: 差出人 fril.jp / 件名「購入申請がありました」または「購入されました」
     if "fril.jp" in sender and ("購入申請" in subject or "購入されました" in subject):
         m = re.search(r"商品名\s*[:：]\s*(.+)", body)
-        m2 = re.search(r"オーダーID\s*[:：]\s*(\S+)", body)
         title = m.group(1).strip() if m else "(商品名を読み取れず)"
-        note = "(購入申請の段階です。承認前でも他サイトは止めておくのが安全)" if "購入申請" in subject else ""
-        return {"site": "ラクマ", "title": title, "id": m2.group(1) if m2 else "",
-                "note": note,
-                "others": [("ヤフオク", LINK_YAHOO), ("メルカリShops", LINK_MERCARI)]}
+        info = {"site": "ラクマ", "title": title}
+        if "購入申請" in subject:
+            info["note"] = "(購入申請の段階です。承認前でも他サイトは止めておくのが安全)"
+        return info
 
     return None
 
 
-def build_message(info):
+def build_message(info, daicho):
+    sold_key = SITE_KEY[info["site"]]
+    row = find_in_daicho(daicho, sold_key, info["title"])
+
     lines = [f"【{info['site']}で売れました】", info["title"]]
     if info.get("note"):
         lines.append(info["note"])
     lines.append("")
     lines.append("↓ 他サイトの取り下げ")
-    for name, link in info["others"]:
-        lines.append(f"・{name}: {link}")
+    for key in ("yahoo", "mercari", "rakuma"):
+        if key == sold_key:
+            continue
+        url = (row or {}).get(key + "_url", "").strip()
+        if url:
+            lines.append(f"・{SITE_NAME[key]}(この商品): {url}")
+        elif row:
+            lines.append(f"・{SITE_NAME[key]}: 台帳では出品なし")
+        else:
+            lines.append(f"・{SITE_NAME[key]}: {FALLBACK_LINK[key]}")
+    if not row:
+        lines.append("※台帳に見つからなかったため一覧ページのリンクです")
     return "\n".join(lines)
 
 
@@ -127,6 +173,9 @@ def save_state(state):
 
 def main():
     password = os.environ["BIGLOBE_PASSWORD"]
+    daicho = load_daicho()
+    print(f"台帳: {len(daicho)}行")
+
     conn = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
     conn.login(MAIL_USER, password)
     conn.select("INBOX", readonly=True)  # readonly: 既読/未読の状態を変えない
@@ -159,7 +208,7 @@ def main():
         info = parse_mail(subject, sender, body)
         if info:
             print(f"売却検知: {info['site']} / {info['title']}")
-            send_ntfy(build_message(info), title=f"{info['site']}で売れました")
+            send_ntfy(build_message(info, daicho), title=f"{info['site']}で売れました")
         else:
             print(f"対象外メール: {subject[:60]}")
 
