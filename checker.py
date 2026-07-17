@@ -197,15 +197,25 @@ def main():
     print(f"新着 {len(new_uids)} 件 (last_uid={last_uid})")
 
     for uid in sorted(new_uids):
-        typ, msgdata = conn.uid("fetch", str(uid), "(RFC822)")
-        if typ != "OK" or not msgdata or msgdata[0] is None:
+        # メール1通の不調で全体を止めない(2026-07-17: サーバー応答の癖で
+        # msgdata[0]がタプルでないことがあり 'int' object has no attribute 'decode' が出た実例)
+        try:
+            typ, msgdata = conn.uid("fetch", str(uid), "(RFC822)")
+            if typ != "OK" or not msgdata:
+                print(f"uid={uid}: 取得失敗(スキップ)")
+                continue
+            part = msgdata[0]
+            if not (isinstance(part, tuple) and len(part) >= 2 and isinstance(part[1], (bytes, bytearray))):
+                print(f"uid={uid}: 応答形式が想定外(スキップ)")
+                continue
+            msg = email.message_from_bytes(part[1], policy=email.policy.default)
+            subject = str(msg.get("Subject", ""))
+            sender = str(msg.get("From", ""))
+            body = get_body_text(msg)
+            info = parse_mail(subject, sender, body)
+        except Exception as e:
+            print(f"uid={uid}: 読み取りエラー(スキップ): {e}")
             continue
-        raw = msgdata[0][1]
-        msg = email.message_from_bytes(raw, policy=email.policy.default)
-        subject = str(msg.get("Subject", ""))
-        sender = str(msg.get("From", ""))
-        body = get_body_text(msg)
-        info = parse_mail(subject, sender, body)
         if info:
             print(f"売却検知: {info['site']} / {info['title']}")
             send_ntfy(build_message(info, daicho), title=f"{info['site']}で売れました")
