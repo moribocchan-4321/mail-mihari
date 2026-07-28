@@ -82,11 +82,17 @@ def parse_mail(subject, sender, body):
             title = m2.group(1).strip() if m2 else "(商品名を読み取れず)"
         return {"site": "ヤフオク", "title": title}
 
-    # メルカリShops: 差出人 mercari-shops.com / 件名「【メルカリShops】「商品名」の発送をお願いします。」
+    # メルカリShops: 差出人 mercari-shops.com
+    # ①「〜の発送をお願いします」=支払い完了(カード払いは購入と同時)
+    # ②「〜が購入されました」=コンビニ/ATM払いの購入直後(支払い待ち)。2026-07-27実例で追加
     if "mercari-shops.com" in sender:
         m = re.search(r"「(.+)」の発送をお願いします", subject)
         if m:
             return {"site": "メルカリShops", "title": m.group(1).strip()}
+        m = re.search(r"「(.+)」が購入されました", subject)
+        if m:
+            return {"site": "メルカリShops", "title": m.group(1).strip(),
+                    "note": "(コンビニ/ATM払いの支払い待ち段階です。他サイトは今すぐ止めるのが安全。支払い完了時にもう1通届きます)"}
 
     # ラクマ: 差出人 fril.jp / 件名「購入申請がありました」または「購入されました」
     if "fril.jp" in sender and ("購入申請" in subject or "購入されました" in subject):
