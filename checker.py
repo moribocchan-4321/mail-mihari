@@ -233,11 +233,42 @@ def main():
     conn.logout()
 
 
+# 接続系の一時障害とみなすエラー文言(2026-11-13: BIGLOBEがGitHub側IPを弾いた実例
+# "command: LOGIN => socket error: EOF" に対応。5分ごとのエラー通知スパムを防ぐ)
+TRANSIENT_MARKERS = ("socket error", "EOF", "timed out", "timeout",
+                     "Connection reset", "Connection refused", "getaddrinfo")
+
 if __name__ == "__main__":
+    prev_fails = (load_state() or {}).get("fail_count", 0)
     try:
         main()
+        if prev_fails >= 3:
+            # 障害からの復旧を知らせる
+            try:
+                send_ntfy(f"BIGLOBEへの接続が復旧しました(障害時間 約{prev_fails * 5}分)。", title="見張り番 復旧")
+            except Exception:
+                pass
+        if prev_fails:
+            st = load_state() or {}
+            st.pop("fail_count", None)
+            save_state(st)
     except Exception as e:
-        # 失敗したらスマホにも知らせる(通知が黙って止まるのを防ぐ)
+        msg = str(e)
+        if any(m in msg for m in TRANSIENT_MARKERS):
+            # 接続障害: 回数を数え、通知は15分時点で1回+以後3時間ごとに1回だけ
+            st = load_state() or {}
+            n = st.get("fail_count", 0) + 1
+            st["fail_count"] = n
+            save_state(st)
+            print(f"接続障害({n}回連続): {msg}", file=sys.stderr)
+            if n == 3 or n % 36 == 0:
+                try:
+                    send_ntfy(f"BIGLOBEに接続できない状態が約{n * 5}分続いています。復旧したら自動で再開します。({msg})",
+                              title="見張り番 接続障害")
+                except Exception:
+                    pass
+            sys.exit(0)  # 一時障害は実行自体は正常扱い(次の5分後に再挑戦)
+        # それ以外の想定外エラーは従来どおり即通知
         try:
             send_ntfy(f"見張り番でエラーが発生しました: {e}", title="見張り番エラー")
         except Exception:
